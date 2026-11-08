@@ -15,8 +15,8 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/raylin666/go-utils/v2/netx"
-	"github.com/raylin666/go-utils/v2/server"
+	"github.com/devpety/go-utils/v2/netx"
+	"github.com/devpety/go-utils/v2/server"
 )
 
 var _ server.Server = (*Server)(nil)

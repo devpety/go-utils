@@ -1,4 +1,4 @@
-module github.com/raylin666/go-utils/v2
+module github.com/devpety/go-utils/v2
 
 go 1.23.0
 

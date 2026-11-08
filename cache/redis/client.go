@@ -6,10 +6,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/raylin666/go-utils/v2/cache/redis/cmd"
+	"github.com/devpety/go-utils/v2/cache/redis/cmd"
 	"github.com/redis/go-redis/v9"
 
-	ut "github.com/raylin666/go-utils/v2"
+	ut "github.com/devpety/go-utils/v2"
 )
 
 var _ Client = (*client)(nil)
