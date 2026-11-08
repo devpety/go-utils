@@ -11,10 +11,14 @@ package gorm
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -184,7 +188,7 @@ type PoolStatistics struct {
 // 使用示例：
 //
 //	// 方式1：使用分离参数配置
-//	client, err := gorm.NewClient(
+//	client, err := gorm.NewClient(context.Background(),
 //	    gorm.WithHost("localhost"),
 //	    gorm.WithPort(3306),
 //	    gorm.WithUserName("root"),
@@ -193,12 +197,12 @@ type PoolStatistics struct {
 //	)
 //
 //	// 方式2：使用 DSN 配置
-//	client, err := gorm.NewClient(
+//	client, err := gorm.NewClient(context.Background(),
 //	    gorm.WithDsn("root:password@tcp(localhost:3306)/test?charset=utf8mb4"),
 //	)
 //
 //	// 方式3：自定义连接池配置
-//	client, err := gorm.NewClient(
+//	client, err := gorm.NewClient(context.Background(),
 //	    gorm.WithHost("localhost"),
 //	    gorm.WithPort(3306),
 //	    gorm.WithUserName("root"),
@@ -208,109 +212,139 @@ type PoolStatistics struct {
 //	    gorm.WithMaxOpenConn(200),     // 自定义最大连接数
 //	    gorm.WithMaxLifeTime(60 * time.Minute), // 自定义生命周期
 //	)
-func NewClient(opts ...Option) (Client, error) {
-	// 初始化默认配置
-	// 设置合理的默认值，避免配置为 0 导致的问题
-	o := &option{
-		MaxIdleConn: 10,               // 默认最大空闲连接数
-		MaxOpenConn: 100,              // 默认最大打开连接数
-		MaxLifeTime: 30 * time.Minute, // 默认连接生命周期 30 分钟
-		Charset:     "utf8mb4",        // 默认字符集 utf8mb4（支持 emoji）
-		ParseTime:   "True",           // 默认解析时间字段
-		Loc:         "Local",          // 默认使用本地时区
+//
+// ctx 约束整个构造过程；失败时回收连接池，成功后业务操作不继承该上下文。
+func NewClient(ctx context.Context, opts ...Option) (result Client, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	// 应用所有配置选项（覆盖默认值）
+	o := &option{
+		Driver: "mysql", MaxIdleConn: 10, MaxOpenConn: 100,
+		MaxLifeTime: 30 * time.Minute, Charset: "utf8mb4", ParseTime: "true", Loc: "Local",
+	}
 	for _, opt := range opts {
 		opt(o)
 	}
-
-	// 输入参数验证
-	// 如果使用完整 DSN，验证 DSN 不为空
-	if len(o.Dsn) > 0 {
-		if o.Dsn == "" {
-			return nil, ErrDsnEmpty
-		}
-	} else {
-		// 使用分离参数配置时，验证必要参数
-		if o.Host == "" {
-			return nil, ErrHostEmpty
-		}
-		if o.Port <= 0 || o.Port > 65535 {
-			return nil, ErrPortInvalid
-		}
-		if o.UserName == "" {
-			return nil, ErrUserNameEmpty
-		}
-		if o.DbName == "" {
-			return nil, ErrDbNameEmpty
-		}
+	if o.Driver != "" && o.Driver != "mysql" {
+		return nil, fmt.Errorf("unsupported database driver: %s", o.Driver)
+	}
+	if o.MaxIdleConn < 0 || o.MaxOpenConn < 0 || o.MaxLifeTime < 0 {
+		return nil, fmt.Errorf("database pool limits and lifetime cannot be negative")
 	}
 
-	// 构建数据源名称（DSN）
-	var dsn string
-	if len(o.Dsn) > 0 {
-		// 使用完整 DSN 配置（优先级最高）
-		dsn = o.Dsn
-	} else {
-		// 使用分离参数构建 DSN
-		// 格式：username:password@tcp(host:port)/dbname?charset=utf8mb4&parseTime=True&loc=Local
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=%s&loc=%s",
-			o.UserName,
-			o.Password,
-			o.Host,
-			o.Port,
-			o.DbName,
-			o.Charset,
-			o.ParseTime,
-			o.Loc)
-	}
-
-	// 打开数据库连接
-	conn, err := gorm.Open(
-		mysql.Open(dsn),
-		&gorm.Config{
-			NamingStrategy: schema.NamingStrategy{
-				TablePrefix:   o.Prefix, // 表名前缀
-				SingularTable: true,     // 禁用表名复数（User -> user，而非 users）
-			},
-		})
-
+	configuration, err := mysqlConfiguration(o)
 	if err != nil {
-		return nil, fmt.Errorf("database connection failed: %w", err)
+		return nil, err
 	}
 
-	// 获取原生 SQL 数据库实例
-	sqlDb, err := conn.DB()
+	connector, err := mysqldriver.NewConnector(configuration)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get SQL instance: %w", err)
+		return nil, fmt.Errorf("invalid database configuration: %w", err)
 	}
 
-	// 配置连接池参数
-	// SetMaxIdleConns: 设置最大空闲连接数
-	// 作用：空闲连接可被复用，减少连接创建开销
-	// 建议：设置为 MaxOpenConns 的 10%-50%
-	sqlDb.SetMaxIdleConns(o.MaxIdleConn)
-
-	// SetMaxOpenConns: 设置最大打开连接数
-	// 作用：限制连接池大小，防止过多连接导致数据库压力
-	// 建议：根据并发量和数据库服务器配置调整
-	sqlDb.SetMaxOpenConns(o.MaxOpenConn)
-
-	// SetConnMaxLifetime: 设置连接最大生命周期
-	// 作用：防止长时间使用同一连接导致的问题
-	// 建议：设置为数据库服务器 wait_timeout 的一半
-	sqlDb.SetConnMaxLifetime(o.MaxLifeTime)
-
-	// 创建客户端实例，设置连接状态为 true
-	c := &client{
-		option: o,
-		db:     conn,
-		sqlDb:  sqlDb,
+	o.Dsn = configuration.FormatDSN()
+	pool := sql.OpenDB(connector)
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, ctx.Err(), pool.Close())
+		}
+	}()
+	pool.SetMaxIdleConns(o.MaxIdleConn)
+	pool.SetMaxOpenConns(o.MaxOpenConn)
+	pool.SetConnMaxLifetime(o.MaxLifeTime)
+	if err := pool.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("database ping failed: %w", err)
 	}
+
+	// MySQL 方言的版本探测使用背景上下文，仅构造期间将它绑定到调用方期限。
+	initializing := &initializationPool{DB: pool, ctx: ctx}
+	dialector := &mysql.Dialector{Config: &mysql.Config{Conn: initializing, DSNConfig: configuration}}
+	connection, err := gorm.Open(dialector, &gorm.Config{
+		DisableAutomaticPing: true,
+		NamingStrategy:       schema.NamingStrategy{TablePrefix: o.Prefix, SingularTable: true},
+		Logger:               o.Logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("database initialization failed: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// 清除初始化上下文，包含 GORM 内部缓存可能保留的连接池引用。
+	initializing.ctx = nil
+	connection.ConnPool = pool
+	connection.Statement.ConnPool = pool
+	dialector.Conn = pool
+	c := &client{option: o, db: connection, sqlDb: pool}
 	c.connected.Store(true)
-
 	return c, nil
+}
+
+// initializationPool 只在构造期间替换版本探测的上下文。
+type initializationPool struct {
+	*sql.DB
+	ctx context.Context
+}
+
+// QueryRowContext 执行查询并返回单行结果，根据上下文替换连接。
+func (pool *initializationPool) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	if pool.ctx != nil {
+		ctx = pool.ctx
+	}
+	return pool.DB.QueryRowContext(ctx, query, args...)
+}
+
+// GetDBConn 获取数据库连接，根据上下文替换。
+func (pool *initializationPool) GetDBConn() (*sql.DB, error) { return pool.DB, nil }
+
+// mysqlConfiguration 配置 MySQL 数据库连接
+func mysqlConfiguration(o *option) (*mysqldriver.Config, error) {
+	if o.Dsn != "" {
+		configuration, err := mysqldriver.ParseDSN(o.Dsn)
+		if err != nil {
+			return nil, fmt.Errorf("invalid database DSN: %w", err)
+		}
+		return configuration, nil
+	}
+	if o.Host == "" {
+		return nil, ErrHostEmpty
+	}
+	if o.Port < 1 || o.Port > 65535 {
+		return nil, ErrPortInvalid
+	}
+	if o.UserName == "" {
+		return nil, ErrUserNameEmpty
+	}
+	if o.DbName == "" {
+		return nil, ErrDbNameEmpty
+	}
+	configuration := mysqldriver.NewConfig()
+	configuration.User, configuration.Passwd, configuration.DBName = o.UserName, o.Password, o.DbName
+	configuration.Net = "tcp"
+	configuration.Addr = net.JoinHostPort(o.Host, strconv.Itoa(o.Port))
+	configuration.ParseTime = true
+	if o.ParseTime != "" {
+		parseTime, err := strconv.ParseBool(o.ParseTime)
+		if err != nil {
+			return nil, fmt.Errorf("invalid parse_time: %w", err)
+		}
+		configuration.ParseTime = parseTime
+	}
+	if o.Loc != "" {
+		location, err := time.LoadLocation(o.Loc)
+		if err != nil {
+			return nil, fmt.Errorf("invalid database location: %w", err)
+		}
+		configuration.Loc = location
+	}
+	charset := o.Charset
+	if charset == "" {
+		charset = "utf8mb4"
+	}
+	
+	configuration.Params = map[string]string{"charset": charset}
+	return configuration, nil
 }
 
 // Options 获取配置选项

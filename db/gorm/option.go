@@ -1,6 +1,10 @@
 package gorm
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm/logger"
+)
 
 // Option 数据库配置选项函数
 // 使用选项模式（Functional Options）进行配置
@@ -24,20 +28,21 @@ type Option func(opt *option)
 //   - ParseTime: 是否解析时间字段
 //   - Loc: 时区设置
 type option struct {
-	Dsn         string        // 数据源名称（完整连接字符串）
-	Driver      string        // 数据库驱动类型
-	DbName      string        // 数据库名称
-	Host        string        // 数据库主机地址
-	UserName    string        // 数据库用户名
-	Password    string        // 数据库密码（敏感信息）
-	Charset     string        // 字符集编码
-	Port        int           // 数据库端口
-	Prefix      string        // 表名前缀
-	MaxIdleConn int           // 最大空闲连接数
-	MaxOpenConn int           // 最大打开连接数
-	MaxLifeTime time.Duration // 连接最大生命周期
-	ParseTime   string        // 是否解析时间
-	Loc         string        // 时区设置
+	Dsn         string           // 数据源名称（完整连接字符串）
+	Driver      string           // 数据库驱动类型
+	DbName      string           // 数据库名称
+	Host        string           // 数据库主机地址
+	UserName    string           // 数据库用户名
+	Password    string           // 数据库密码（敏感信息）
+	Charset     string           // 字符集编码
+	Port        int              // 数据库端口
+	Prefix      string           // 表名前缀
+	MaxIdleConn int              // 最大空闲连接数
+	MaxOpenConn int              // 最大打开连接数
+	MaxLifeTime time.Duration    // 连接最大生命周期
+	ParseTime   string           // 是否解析时间
+	Loc         string           // 时区设置
+	Logger      logger.Interface // 构造及运行期间的日志记录器
 }
 
 // WithDsn 设置数据源名称（DSN）
@@ -49,9 +54,10 @@ type option struct {
 //   - dsn: 数据源名称，格式如 "user:password@tcp(host:port)/dbname?charset=utf8mb4&parseTime=True&loc=Local"
 //
 // 使用示例：
-//   client, err := gorm.NewClient(
-//       gorm.WithDsn("root:password@tcp(localhost:3306)/test?charset=utf8mb4"),
-//   )
+//
+//	client, err := gorm.NewClient(context.Background(),
+//	    gorm.WithDsn("root:password@tcp(localhost:3306)/test?charset=utf8mb4"),
+//	)
 func WithDsn(dsn string) Option {
 	return func(opt *option) {
 		opt.Dsn = dsn
@@ -108,8 +114,9 @@ func WithUserName(userName string) Option {
 //   - password: 数据库密码
 //
 // 使用示例：
-//   password := os.Getenv("DB_PASSWORD")
-//   client, err := gorm.NewClient(gorm.WithPassword(password))
+//
+//	password := os.Getenv("DB_PASSWORD")
+//	client, err := gorm.NewClient(context.Background(), gorm.WithPassword(password))
 func WithPassword(password string) Option {
 	return func(opt *option) {
 		opt.Password = password
@@ -147,8 +154,9 @@ func WithPort(port int) Option {
 //   - prefix: 表名前缀，如 "app_"
 //
 // 使用示例：
-//   // 设置前缀后，表名 "users" 实际为 "app_users"
-//   client, err := gorm.NewClient(gorm.WithPrefix("app_"))
+//
+//	// 设置前缀后，表名 "users" 实际为 "app_users"
+//	client, err := gorm.NewClient(context.Background(), gorm.WithPrefix("app_"))
 func WithPrefix(prefix string) Option {
 	return func(opt *option) {
 		opt.Prefix = prefix
@@ -203,9 +211,10 @@ func WithMaxOpenConn(maxOpenConn int) Option {
 //   - maxLifeTime: 连接最大生命周期（time.Duration），默认 30 分钟
 //
 // 使用示例：
-//   client, err := gorm.NewClient(
-//       gorm.WithMaxLifeTime(30 * time.Minute),
-//   )
+//
+//	client, err := gorm.NewClient(context.Background(),
+//	    gorm.WithMaxLifeTime(30 * time.Minute),
+//	)
 func WithMaxLifeTime(maxLifeTime time.Duration) Option {
 	return func(opt *option) {
 		opt.MaxLifeTime = maxLifeTime
@@ -236,4 +245,9 @@ func WithLoc(loc string) Option {
 	return func(opt *option) {
 		opt.Loc = loc
 	}
+}
+
+// WithLogger 设置构造及运行期间使用的 GORM 日志记录器。
+func WithLogger(value logger.Interface) Option {
+	return func(opt *option) { opt.Logger = value }
 }

@@ -64,21 +64,20 @@ type Server struct {
 	tlsConf  *tls.Config
 }
 
+// NewServer 使用传入的服务器配置；显式选项覆盖监听地址和 TLS 配置。
 func NewServer(hs *http.Server, opts ...ServerOption) *Server {
-	var srv = &Server{
-		network: "tcp",
+	if hs == nil {
+		hs = &http.Server{}
 	}
+	srv := &Server{Server: hs, network: "tcp", tlsConf: hs.TLSConfig}
 	for _, opt := range opts {
 		opt(srv)
 	}
-
-	if srv.address == "" && srv.Server.Addr != "" {
+	if srv.address == "" {
 		srv.address = srv.Server.Addr
 	}
-	if hs.TLSConfig == nil {
-		hs.TLSConfig = srv.tlsConf
-	}
-	srv.Server = hs
+	// 监听方式与注册端点必须使用同一份有效 TLS 配置。
+	srv.Server.TLSConfig = srv.tlsConf
 	return srv
 }
 

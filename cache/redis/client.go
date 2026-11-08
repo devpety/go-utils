@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,7 @@ var (
 	ErrPortInvalid       = fmt.Errorf("Redis port must be in range 1-65535")
 	ErrDBIndexInvalid    = fmt.Errorf("Redis database index must be in range 0-15")
 	ErrPoolSizeInvalid   = fmt.Errorf("pool size must be greater than 0")
-	ErrMaxRetriesInvalid = fmt.Errorf("max retries cannot be negative")
+	ErrMaxRetriesInvalid = fmt.Errorf("max retries must be -1 or non-negative")
 )
 
 // Client Redis客户端接口，提供完整的Redis命令支持
@@ -872,7 +873,13 @@ type client struct {
 	connected atomic.Bool
 }
 
+// NewClient 在 ctx 期限内完成拨号、认证及探活；失败时回收所有已创建连接。
+// 成功交付后解除构造上下文绑定，运行期重连使用各次调用的上下文。
 func NewClient(ctx context.Context, opt *Options) (Client, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if opt == nil {
 		return nil, fmt.Errorf("Redis configuration options cannot be empty")
 	}
@@ -888,21 +895,49 @@ func NewClient(ctx context.Context, opt *Options) (Client, error) {
 	if opt.PoolSize < 0 {
 		return nil, ErrPoolSizeInvalid
 	}
-
-	if opt.MaxRetries < 0 {
+	if opt.MaxRetries < -1 {
 		return nil, ErrMaxRetriesInvalid
 	}
 
-	var c = new(client)
-	c.options = opt
-	c.client = redis.NewClient(&opt.Options)
-
-	if err := c.Ping(ctx).Err(); err != nil {
-		c.connected.Store(false)
-		return nil, fmt.Errorf("Redis connection failed: %w", err)
+	// go-redis 会原地归一化配置，不能修改调用方传入的重试及超时开关。
+	options := *opt
+	if options.TLSConfig != nil {
+		options.TLSConfig = options.TLSConfig.Clone()
 	}
 
+	// 建立守卫
+	guard := newInitialization(ctx)
+	
+	// 保留原始拨号器
+	baseDialer := options.Dialer 
+	if baseDialer == nil {
+		baseDialer = defaultDialer(&options.Options)
+	}
+
+	// 包装拨号器
+	options.Dialer = guard.dialer(baseDialer) 
+
+	// 创建客户端
+	c := &client{options: &options, client: redis.NewClient(&options.Options)}
+	
+	// 触发拨号+认证+探活
+	err := c.Ping(ctx).Err()
+
+	// 成功：解除守卫
+	if err == nil {
+		err = guard.commit()
+	}
+
+	// 失败：中断并回收
+	if err != nil {
+		guard.abort()
+		return nil, fmt.Errorf("Redis connection failed: %w", errors.Join(err, ctx.Err(), c.Close()))
+	}
+
+	// 成功：设置连接状态为已连接
 	c.connected.Store(true)
+
+	// 成功：返回客户端
 	return c, nil
 }
 
