@@ -1,242 +1,200 @@
-// Package auth 提供 JWT 认证工具，支持 HS256 签名算法。
-// 功能特性：
-//   - JWT Token 生成与解析
-//   - 支持自定义 Claims 配置
-//   - 完善的错误类型定义
-//
-// 安全说明：
-//   - HS256 算法要求密钥至少 32 字节以确保安全性
-//   - 建议使用强随机密钥，不要使用简单字符串
-//   - 密钥应通过环境变量或密钥管理服务传递
+// Package auth 提供使用显式算法与密钥策略的 JWT 签发和验证。
 package auth
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 	"time"
 
 	gojwt "github.com/golang-jwt/jwt/v5"
 )
 
-// 定义具体错误类型，便于调用方精确判断错误原因
-// 使用 errors.Is() 进行错误类型判断
 var (
-	// ErrTokenMalformed Token 格式错误
-	// 原因：Token 字符串格式不正确，无法解析
+	// ErrTokenMalformed 表示令牌格式错误。
 	ErrTokenMalformed = errors.New("token is malformed")
-
-	// ErrTokenExpired Token 已过期
-	// 原因：Token 的过期时间已超过当前时间
+	// ErrTokenExpired 表示令牌已过期。
 	ErrTokenExpired = errors.New("token is expired")
-
-	// ErrTokenNotActive Token 未激活
-	// 原因：Token 的生效时间未到（nbf 字段）
+	// ErrTokenNotActive 表示令牌尚未生效。
 	ErrTokenNotActive = errors.New("token not active yet")
-
-	// ErrTokenInvalid Token 无效
-	// 原因：Token 签名验证失败或其他未知错误
+	// ErrTokenInvalid 表示签名或声明不符合配置。
 	ErrTokenInvalid = errors.New("token is invalid")
-
-	// ErrAppEmpty 应用名称为空
-	// 原因：创建 JWT 时未提供应用名称
+	// ErrAppEmpty 表示应用名称为空。
 	ErrAppEmpty = errors.New("app name cannot be empty")
-
-	// ErrKeyEmpty 签发者为空
-	// 原因：创建 JWT 时未提供签发者标识
-	ErrKeyEmpty = errors.New("key cannot be empty")
-
-	// ErrSecretTooShort 密钥长度不足
-	// 原因：HS256 算法要求密钥至少 32 字节
-	// 安全建议：使用强随机密钥（如 openssl rand -base64 32）
-	ErrSecretTooShort = errors.New("secret must be at least 32 bytes for HS256 algorithm security")
+	// ErrKeyEmpty 表示签发者标识为空。
+	ErrKeyEmpty = errors.New("issuer cannot be empty")
+	// ErrSecretTooShort 表示 HMAC 密钥短于所选算法的哈希长度。
+	ErrSecretTooShort = errors.New("HMAC secret is shorter than the algorithm hash size")
+	// ErrJWTAlgorithm 表示配置了不支持的算法。
+	ErrJWTAlgorithm = errors.New("unsupported JWT algorithm")
+	// ErrJWTKey 表示密钥类型、长度或内容无效。
+	ErrJWTKey = errors.New("invalid JWT key")
+	// ErrSigningKeyUnavailable 表示当前实例只有验签公钥。
+	ErrSigningKeyUnavailable = errors.New("JWT signing key is unavailable")
+	// ErrTokenLifetime 表示令牌有效时长不能生成未来的过期时间。
+	ErrTokenLifetime = errors.New("token lifetime must produce a future expiration")
 )
 
-// 编译期接口验证，确保 jwt 实现了 JWT 接口
-var _ JWT = (*jwt)(nil)
+// JWTAlgorithm 表示构造时显式选择的 JWT 签名算法。
+type JWTAlgorithm string
 
-// JWT 定义 JWT 认证接口
-// 使用场景：
-//   - 用户登录认证
-//   - API 接口鉴权
-//   - 单点登录（SSO）
+// 支持的算法；默认使用 HS256，不接受未签名的令牌。
+const (
+	HS256 JWTAlgorithm = "HS256"
+	HS384 JWTAlgorithm = "HS384"
+	HS512 JWTAlgorithm = "HS512"
+	RS256 JWTAlgorithm = "RS256"
+	RS384 JWTAlgorithm = "RS384"
+	RS512 JWTAlgorithm = "RS512"
+	PS256 JWTAlgorithm = "PS256"
+	PS384 JWTAlgorithm = "PS384"
+	PS512 JWTAlgorithm = "PS512"
+	ES256 JWTAlgorithm = "ES256"
+	ES384 JWTAlgorithm = "ES384"
+	ES512 JWTAlgorithm = "ES512"
+	EdDSA JWTAlgorithm = "EdDSA"
+)
+
+// JWT 提供令牌签发与验证，解析严格使用构造时配置的算法及身份约束。
 type JWT interface {
-	// GenerateToken 生成 JWT Token
-	// 功能说明：
-	//   - 生成包含用户信息的 JWT Token
-	//   - 使用 HS256 算法签名
-	//   - 支持自定义 audience（接收方）
-	//
-	// 参数：
-	//   - id: 用户唯一标识符（如用户ID、用户名）
-	//   - expireDuration: Token 过期时长（如 24小时）
-	//   - audience: 可选的接收方列表（不传则默认为用户ID）
-	//
-	// 返回值：
-	//   - tokenString: 生成的 JWT Token 字符串
-	//   - err: 生成失败时的错误信息
-	//
-	// 使用示例：
-	//   jwt, _ := auth.NewJWT("my-app", "issuer", "secret-key-32-bytes")
-	//   token, err := jwt.GenerateToken("user-123", time.Hour)
-	//   // 或指定 audience
-	//   token, err := jwt.GenerateToken("user-123", time.Hour, "service-a", "service-b")
 	GenerateToken(id string, expireDuration time.Duration, audience ...string) (string, error)
-
-	// ParseToken 解析 JWT Token
-	// 功能说明：
-	//   - 解析并验证 JWT Token
-	//   - 提取 Claims 信息
-	//   - 验证签名、过期时间、生效时间等
-	//
-	// 参数：
-	//   - tokenString: JWT Token 字符串
-	//
-	// 返回值：
-	//   - *jwtClaims: 解析后的 Claims 信息
-	//   - error: 解析失败时的错误（可使用 errors.Is 判断具体类型）
-	//
-	// 使用示例：
-	//   claims, err := jwt.ParseToken(tokenString)
-	//   if errors.Is(err, auth.ErrTokenExpired) {
-	//       // Token 已过期，需要重新登录
-	//   }
-	//   userID := claims.ID
 	ParseToken(tokenString string) (*jwtClaims, error)
 }
 
-// jwt JWT 认证实现
-// 字段说明：
-//   - app: 应用名称（用于 Token Subject）
-//   - key: 签发者标识（用于 Token Issuer）
-//   - secret: 签名密钥（至少 32 字节）
+// JWTOption 配置算法或接收方策略。
+type JWTOption func(*jwtOptions)
+
+type jwtOptions struct {
+	algorithm JWTAlgorithm
+	audience  []string
+}
+
+// WithJWTAlgorithm 设置签发和验签使用的唯一算法。
+func WithJWTAlgorithm(algorithm JWTAlgorithm) JWTOption {
+	return func(options *jwtOptions) { options.algorithm = algorithm }
+}
+
+// WithJWTAudience 设置验签允许的接收方，任一匹配即可；未显式签发 audience 时也使用该列表。
+// 不配置时不约束接收方，签发仍默认使用用户 ID。
+func WithJWTAudience(audience ...string) JWTOption {
+	copied := slices.Clone(audience)
+	return func(options *jwtOptions) { options.audience = slices.Clone(copied) }
+}
+
 type jwt struct {
-	app    string // 应用名称
-	key    string // 签发者标识
-	secret string // 签名密钥（敏感信息）
+	app             string
+	issuer          string
+	method          gojwt.SigningMethod
+	signingKey      any
+	verificationKey any
+	audience        []string
+	parser          *gojwt.Parser
 }
 
-// jwtClaims JWT Claims 结构体
-// 继承标准 RegisteredClaims，包含以下字段：
-//   - Issuer (iss): 签发者
-//   - Subject (sub): 主题（应用名称）
-//   - Audience (aud): 接收方
-//   - ExpiresAt (exp): 过期时间
-//   - NotBefore (nbf): 生效时间
-//   - IssuedAt (iat): 签发时间
-//   - ID (jti): JWT ID（用户唯一标识）
 type jwtClaims struct {
-	gojwt.RegisteredClaims // 内嵌标准 Claims
+	gojwt.RegisteredClaims
 }
 
-// NewJWT 创建 JWT 实例
-// 功能说明：
-//   - 创建配置好的 JWT 认证实例
-//   - 验证必要参数（应用名称、签发者、密钥）
-//   - 强制密钥长度至少 32 字节（HS256 安全要求）
-//
-// 参数：
-//   - app: 应用名称，不能为空（用于 Token Subject）
-//   - key: 签发者标识，不能为空（用于 Token Issuer）
-//   - secret: 签名密钥，至少 32 字节（建议使用强随机密钥）
-//
-// 返回值：
-//   - JWT: JWT 实例
-//   - error: 参数校验失败时的错误
-//     可能错误：ErrAppEmpty、ErrKeyEmpty、ErrSecretTooShort
-//
-// 安全建议：
-//   - 密钥生成：openssl rand -base64 32
-//   - 密钥存储：环境变量或密钥管理服务
-//   - 密钥更新：定期更换密钥，支持密钥轮转
-//
-// 使用示例：
-//
-//	jwt, err := auth.NewJWT(
-//	    "my-app",           // 应用名称
-//	    "auth-service",     // 签发者标识
-//	    "strong-secret-key-at-least-32-bytes", // 强密钥
-//	)
-//	if err != nil {
-//	    if errors.Is(err, auth.ErrSecretTooShort) {
-//	        // 密钥长度不足，需要重新生成
-//	    }
-//	    panic(err)
-//	}
-func NewJWT(app, key, secret string) (JWT, error) {
+var _ JWT = (*jwt)(nil)
+
+// NewJWT 根据算法校验密钥，默认 HS256。
+// HMAC 接受 string 或 []byte；RSA、ECDSA 接受标准库私钥或公钥，EdDSA 接受 ed25519 密钥。
+// 私钥用于签发并自动提取公钥验签；只提供公钥时，GenerateToken 返回 ErrSigningKeyUnavailable。
+// 不同信任域应使用独立密钥，调用方不应在构造后修改传入的非对称密钥。
+func NewJWT(app, issuer string, key any, opts ...JWTOption) (JWT, error) {
 	if app == "" {
 		return nil, ErrAppEmpty
 	}
-	if key == "" {
+	if issuer == "" {
 		return nil, ErrKeyEmpty
 	}
-	if len(secret) < 32 {
-		return nil, ErrSecretTooShort
-	}
-	return &jwt{app: app, key: key, secret: secret}, nil
-}
 
-// GenerateToken 生成 JWT Token 签名
-// 功能说明：
-//   - 生成包含用户信息的 JWT Token
-//   - 使用 HS256 算法签名
-//   - 包含标准 Claims（iss、sub、aud、exp、nbf、iat、jti）
-//
-// Token 内容说明：
-//   - iss (Issuer): 签发者，由 key 参数指定
-//   - iat (Issued At): 签发时间，当前时间
-//   - exp (Expiration Time): 过期时间，当前时间 + expireDuration
-//   - aud (Audience): 接收方，默认为用户 ID，可自定义
-//   - sub (Subject): 主题，应用名称
-//   - nbf (Not Before): 生效时间，当前时间
-//   - jti (JWT ID): JWT 唯一标识，用户 ID
-func (t *jwt) GenerateToken(id string, expireDuration time.Duration, audience ...string) (string, error) {
-	ts := time.Now()
-	claims := jwtClaims{
-		gojwt.RegisteredClaims{
-			Issuer:    t.key,
-			Subject:   t.app,
-			NotBefore: gojwt.NewNumericDate(ts),
-			IssuedAt:  gojwt.NewNumericDate(ts),
-			ExpiresAt: gojwt.NewNumericDate(ts.Add(expireDuration)),
-			ID:        id,
-		},
-	}
-	if len(audience) > 0 {
-		claims.Audience = audience
-	} else {
-		claims.Audience = []string{id}
-	}
-	return gojwt.NewWithClaims(gojwt.SigningMethodHS256, claims).SignedString([]byte(t.secret))
-}
-
-// ParseToken 解析 JWT Token 签名
-// 功能说明：
-//   - 解析并验证 JWT Token
-//   - 提取 Claims 信息
-//   - 验证签名、过期时间、生效时间等
-//
-// 返回值错误类型：
-//   - ErrTokenMalformed: Token 格式错误
-//   - ErrTokenExpired: Token 已过期
-//   - ErrTokenNotActive: Token 未激活
-//   - ErrTokenInvalid: Token 无效
-func (t *jwt) ParseToken(tokenString string) (*jwtClaims, error) {
-	tokenClaims, err := gojwt.ParseWithClaims(tokenString, &jwtClaims{}, func(token *gojwt.Token) (interface{}, error) {
-		return []byte(t.secret), nil
-	})
-	if err != nil {
-		if errors.Is(err, gojwt.ErrTokenMalformed) {
-			return nil, ErrTokenMalformed
-		} else if errors.Is(err, gojwt.ErrTokenExpired) {
-			return nil, ErrTokenExpired
-		} else if errors.Is(err, gojwt.ErrTokenNotValidYet) {
-			return nil, ErrTokenNotActive
+	options := jwtOptions{algorithm: HS256}
+	for _, opt := range opts {
+		if opt == nil {
+			return nil, fmt.Errorf("%w: nil option", ErrJWTAlgorithm)
 		}
-		return nil, ErrTokenInvalid
+		opt(&options)
 	}
-	if tokenClaims != nil {
-		if claims, ok := tokenClaims.Claims.(*jwtClaims); ok && tokenClaims.Valid {
+
+	for _, audience := range options.audience {
+		if audience == "" {
+			return nil, fmt.Errorf("%w: audience cannot be empty", ErrTokenInvalid)
+		}
+	}
+
+	method, signingKey, verificationKey, err := jwtKeys(options.algorithm, key)
+	if err != nil {
+		return nil, err
+	}
+
+	parserOptions := []gojwt.ParserOption{
+		gojwt.WithValidMethods([]string{method.Alg()}),
+		gojwt.WithIssuer(issuer), gojwt.WithSubject(app), gojwt.WithExpirationRequired(),
+	}
+
+	if len(options.audience) > 0 {
+		parserOptions = append(parserOptions, gojwt.WithAudience(options.audience...))
+	}
+
+	return &jwt{app: app, issuer: issuer, method: method, signingKey: signingKey,
+		verificationKey: verificationKey, audience: options.audience, parser: gojwt.NewParser(parserOptions...)}, nil
+}
+
+// GenerateToken 使用配置的算法签发令牌；过期时间必须位于未来。
+func (t *jwt) GenerateToken(id string, expireDuration time.Duration, audience ...string) (string, error) {
+	if t.signingKey == nil {
+		return "", ErrSigningKeyUnavailable
+	}
+
+	ts := time.Now()
+	expiration := gojwt.NewNumericDate(ts.Add(expireDuration))
+	if expireDuration <= 0 || !expiration.After(ts) {
+		return "", ErrTokenLifetime
+	}
+
+	if len(audience) == 0 {
+		audience = t.audience
+		if len(audience) == 0 {
+			audience = []string{id}
+		}
+	}
+
+	claims := jwtClaims{gojwt.RegisteredClaims{
+		Issuer: t.issuer, Subject: t.app, NotBefore: gojwt.NewNumericDate(ts), IssuedAt: gojwt.NewNumericDate(ts),
+		ExpiresAt: expiration, ID: id, Audience: slices.Clone(audience),
+	}}
+
+	return gojwt.NewWithClaims(t.method, claims).SignedString(t.signingKey)
+}
+
+// ParseToken 校验配置的算法、签名、签发者、应用、生效与过期时间及可选接收方。
+func (t *jwt) ParseToken(tokenString string) (*jwtClaims, error) {
+	token, err := t.parser.ParseWithClaims(tokenString, &jwtClaims{}, func(token *gojwt.Token) (any, error) {
+		if token.Method.Alg() != t.method.Alg() {
+			return nil, ErrJWTAlgorithm
+		}
+		return t.verificationKey, nil
+	})
+
+	if err != nil {
+		classification := ErrTokenInvalid
+		switch {
+		case errors.Is(err, gojwt.ErrTokenMalformed):
+			classification = ErrTokenMalformed
+		case errors.Is(err, gojwt.ErrTokenExpired):
+			classification = ErrTokenExpired
+		case errors.Is(err, gojwt.ErrTokenNotValidYet):
+			classification = ErrTokenNotActive
+		}
+		return nil, errors.Join(classification, err)
+	}
+
+	if token != nil && token.Valid {
+		if claims, ok := token.Claims.(*jwtClaims); ok {
 			return claims, nil
 		}
 	}
+	
 	return nil, ErrTokenInvalid
 }

@@ -19,6 +19,9 @@ import (
 	"github.com/devpety/go-utils/v2/server"
 )
 
+// ErrServerAlreadyStarted 表示同一实例正在提供服务，不能重复启动。
+var ErrServerAlreadyStarted = errors.New("HTTP server has already started")
+
 var _ server.Server = (*Server)(nil)
 var _ server.Endpointer = (*Server)(nil)
 
@@ -55,8 +58,9 @@ func WithServerTLSConfig(c *tls.Config) ServerOption {
 type Server struct {
 	*http.Server
 
-	once     sync.Once
-	err      error
+	mu       sync.Mutex
+	started  bool
+	stopped  bool
 	network  string
 	address  string
 	lis      net.Listener
@@ -81,57 +85,118 @@ func NewServer(hs *http.Server, opts ...ServerOption) *Server {
 	return srv
 }
 
-// Endpoint return a real address to registry endpoint.
-// examples:
-//
-//	http://127.0.0.1:8000?isSecure=false
+// ensureListener 在持有 mu 时创建监听器，独立于对外公布的 Endpoint。
+func (s *Server) ensureListener() (net.Listener, error) {
+	if s.stopped {
+		return nil, http.ErrServerClosed
+	}
+	if s.lis != nil {
+		return s.lis, nil
+	}
+	listener, err := net.Listen(s.network, s.address)
+	if err != nil {
+		return nil, err
+	}
+	s.lis = listener
+	return listener, nil
+}
+
+// Endpoint 返回对外公布的地址；自动地址需要先绑定端口，以正确解析端口 0。
+// 显式 Endpoint 只提供注册信息，不替代 Start 创建实际监听器。
 func (s *Server) Endpoint() (*url.URL, error) {
-	s.once.Do(func() {
-		if s.endpoint != nil {
-			return
-		}
-		lis, err := net.Listen(s.network, s.address)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.endpoint == nil {
+		listener, err := s.ensureListener()
 		if err != nil {
-			s.err = err
-			return
+			return nil, err
 		}
-		addr, err := netx.ExtractAddress(s.address, lis)
+		address, err := netx.ExtractAddress(s.address, listener)
 		if err != nil {
-			_ = lis.Close()
-			s.err = err
-			return
+			if s.started {
+				return nil, err
+			}
+			s.lis = nil
+			return nil, errors.Join(err, closeListener(listener))
 		}
-		s.lis = lis
-
-		s.endpoint = server.NewEndpoint("http", addr, s.tlsConf != nil)
-	})
-	if s.err != nil {
-		return nil, s.err
+		s.endpoint = server.NewEndpoint("http", address, s.tlsConf != nil)
 	}
-	return s.endpoint, nil
+	endpoint := *s.endpoint
+	return &endpoint, nil
 }
 
-func (s *Server) Start(ctx context.Context) error {
-	if _, err := s.Endpoint(); err != nil {
+// Start 提供服务；同一实例只运行一个生命周期，停止后不会重新打开端口。
+// 显式停止视为正常退出；启动失败时关闭已创建但尚未被 net/http 接管的监听器。
+func (s *Server) Start(ctx context.Context) (err error) {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.started {
+		s.mu.Unlock()
+		return ErrServerAlreadyStarted
+	}
+	if err := ctx.Err(); err != nil {
+		s.stopped = true
+		listener := s.lis
+		s.mu.Unlock()
+		return errors.Join(err, s.Server.Close(), closeListener(listener))
+	}
+	listener, err := s.ensureListener()
+	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
-	s.BaseContext = func(net.Listener) context.Context {
-		return ctx
+	s.started = true
+	s.BaseContext = func(net.Listener) context.Context { return ctx }
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.stopped = true
+		s.mu.Unlock()
+		err = errors.Join(err, closeListener(listener))
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	var err error
 	if s.tlsConf != nil {
-		err = s.ServeTLS(s.lis, "", "")
+		err = s.ServeTLS(listener, "", "")
 	} else {
-		err = s.Serve(s.lis)
+		err = s.Serve(listener)
 	}
-	if !errors.Is(err, http.ErrServerClosed) {
-		return err
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
 	}
-	return nil
+	return err
 }
 
-// Stop the HTTP server.
+// Stop 优雅排空请求，同时回收 Endpoint 可能提前创建的监听器。
 func (s *Server) Stop(ctx context.Context) error {
-	return s.Shutdown(ctx)
+	s.mu.Lock()
+	s.stopped = true
+	listener := s.lis
+	s.mu.Unlock()
+	return errors.Join(s.Server.Shutdown(ctx), closeListener(listener))
+}
+
+// Close 立即关闭连接及尚未交付给 Serve 的监听器。
+func (s *Server) Close() error {
+	s.mu.Lock()
+	s.stopped = true
+	listener := s.lis
+	s.mu.Unlock()
+	return errors.Join(s.Server.Close(), closeListener(listener))
+}
+
+// closeListener 关闭监听器，忽略已关闭错误。
+func closeListener(listener net.Listener) error {
+	if listener == nil {
+		return nil
+	}
+	err := listener.Close()
+	if errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }

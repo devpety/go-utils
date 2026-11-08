@@ -23,6 +23,10 @@ const (
 // Initialize 初始化GORM插件，注册回调函数
 // 在所有SQL操作前后注册钩子函数，用于监控和追踪
 func (op *Plugin) Initialize(db *gorm.DB) (err error) {
+	if op.Before == nil && !op.needsTiming() {
+		return nil
+	}
+
 	if err = db.Callback().Create().Before("gorm:before_create").Register(callBackBeforeName, op.before); err != nil {
 		return err
 	}
@@ -40,6 +44,10 @@ func (op *Plugin) Initialize(db *gorm.DB) (err error) {
 	}
 	if err = db.Callback().Raw().Before("gorm:raw").Register(callBackBeforeName, op.before); err != nil {
 		return err
+	}
+
+	if !op.needsTiming() {
+		return nil
 	}
 
 	if err = db.Callback().Create().After("gorm:after_create").Register(callBackAfterName, op.after); err != nil {
@@ -122,7 +130,10 @@ func (op *Plugin) Name() string {
 // before SQL执行前钩子
 // 记录开始时间，用于后续计算执行时长
 func (op *Plugin) before(db *gorm.DB) {
-	db.InstanceSet(startTime, time.Now())
+	if op.needsTiming() {
+		db.InstanceSet(startTime, time.Now())
+	}
+
 	if op.Before != nil {
 		op.Before(db)
 	}
@@ -142,18 +153,24 @@ func (op *Plugin) after(db *gorm.DB) {
 	}
 	// 计算SQL执行时长
 	duration := time.Since(ts)
-	// 构建SQL语句
+	slowQuery := op.OnSlowQuery != nil && op.SlowThreshold > 0 && duration > op.SlowThreshold
+	if op.After == nil && !slowQuery {
+		return
+	}
+	// 只有实际消费者需要 SQL 时才展开参数。
 	sql := db.Dialector.Explain(db.Statement.SQL.String(), db.Statement.Vars...)
-	// 检查慢查询
-
-	if op.SlowThreshold > 0 && duration > op.SlowThreshold {
-		if op.OnSlowQuery != nil {
-			op.OnSlowQuery(db, sql, duration)
-		}
+	if slowQuery {
+		op.OnSlowQuery(db, sql, duration)
 	}
 
 	// 执行After回调
 	if op.After != nil {
 		op.After(db, sql, ts)
 	}
+}
+
+// needsTiming 返回是否需要记录执行时长
+// 有After回调或OnSlowQuery回调时，需要记录执行时长
+func (op *Plugin) needsTiming() bool {
+	return op.After != nil || (op.SlowThreshold > 0 && op.OnSlowQuery != nil)
 }

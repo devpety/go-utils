@@ -875,6 +875,8 @@ type client struct {
 
 // NewClient 在 ctx 期限内完成拨号、认证及探活；失败时回收所有已创建连接。
 // 成功交付后解除构造上下文绑定，运行期重连使用各次调用的上下文。
+// 运行期命令遵守 ctx Deadline；-1 仅禁用默认 socket 超时，拒绝绕过 Deadline 的 -2。
+// 提前取消能否立即中断在途读写，仍受底层 go-redis 的实现约束。
 func NewClient(ctx context.Context, opt *Options) (Client, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -898,28 +900,33 @@ func NewClient(ctx context.Context, opt *Options) (Client, error) {
 	if opt.MaxRetries < -1 {
 		return nil, ErrMaxRetriesInvalid
 	}
+	if opt.ReadTimeout == -2 || opt.WriteTimeout == -2 {
+		return nil, fmt.Errorf("Redis read/write timeout -2 disables context deadlines; use -1 to disable only the default socket timeout")
+	}
 
 	// go-redis 会原地归一化配置，不能修改调用方传入的重试及超时开关。
 	options := *opt
+	// 命令始终使用调用方期限，不允许配置关闭上下文 Deadline。
+	options.ContextTimeoutEnabled = true
 	if options.TLSConfig != nil {
 		options.TLSConfig = options.TLSConfig.Clone()
 	}
 
 	// 建立守卫
 	guard := newInitialization(ctx)
-	
+
 	// 保留原始拨号器
-	baseDialer := options.Dialer 
+	baseDialer := options.Dialer
 	if baseDialer == nil {
 		baseDialer = defaultDialer(&options.Options)
 	}
 
 	// 包装拨号器
-	options.Dialer = guard.dialer(baseDialer) 
+	options.Dialer = guard.dialer(baseDialer)
 
 	// 创建客户端
 	c := &client{options: &options, client: redis.NewClient(&options.Options)}
-	
+
 	// 触发拨号+认证+探活
 	err := c.Ping(ctx).Err()
 
