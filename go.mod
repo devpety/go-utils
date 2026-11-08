@@ -1,4 +1,4 @@
-module github.com/devpety/go-utils/v2
+module github.com/devpety/go-utils/v3
 
 go 1.23.0
 

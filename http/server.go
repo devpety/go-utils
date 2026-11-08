@@ -15,8 +15,8 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/devpety/go-utils/v2/netx"
-	"github.com/devpety/go-utils/v2/server"
+	"github.com/devpety/go-utils/v3/netx"
+	"github.com/devpety/go-utils/v3/server"
 )
 
 // ErrServerAlreadyStarted 表示同一实例正在提供服务，不能重复启动。

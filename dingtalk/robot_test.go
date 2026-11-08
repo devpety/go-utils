@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	httpclient "github.com/devpety/go-utils/v2/http"
+	httpclient "github.com/devpety/go-utils/v3/http"
 )
 
 func TestRobotSendTextMessage(t *testing.T) {

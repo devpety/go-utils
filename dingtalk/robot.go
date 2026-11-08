@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"net/http"
 
-	httpclient "github.com/devpety/go-utils/v2/http"
+	httpclient "github.com/devpety/go-utils/v3/http"
 )
 
 const (
